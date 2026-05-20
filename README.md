@@ -265,4 +265,4 @@ Pull requests are welcome. For major changes, please open an issue first.
 
 ## 📜 License
 
-MIT © [FuegoDev](https://github.com/fuegodev369)
+MIT © [FuegoDev](https://github.com/fuegodev369/dirsync)
