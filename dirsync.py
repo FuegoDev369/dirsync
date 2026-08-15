@@ -30,11 +30,12 @@ Usage:
     python dirsync.py --source /a --dest /b    # override paths on the fly
     python dirsync.py --no-color               # disable color output (pipes, CI)
     python dirsync.py --config                 # open settings menu
+    python dirsync.py --backups                # browse and restore backups
     python dirsync.py --version
     python dirsync.py --help
 """
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 __author__  = "FuegoDev"
 __license__ = "MIT"
 
@@ -52,6 +53,7 @@ import tempfile
 import time
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -81,6 +83,7 @@ DEFAULT_CONFIG = {
     ],
     "delete_orphans":     False,
     "backup_before_sync": False,
+    "backup_mode":        "full",
 }
 
 # Populated in main() based on TTY detection and --no-color flag.
@@ -236,7 +239,39 @@ def show_config(config):
     cprint(f"  Ignored         : {', '.join(config['ignore_patterns'])}", Colors.GREY)
     cprint(f"  Delete orphans  : {'Yes' if config['delete_orphans'] else 'No'}", Colors.GREY)
     cprint(f"  Auto backup     : {'Yes' if config['backup_before_sync'] else 'No'}", Colors.GREY)
+    cprint(f"  Backup mode     : {config['backup_mode']}", Colors.GREY)
     print()
+
+
+def _prompt_config_path(current, label):
+    """
+    Prompt for a new value for a path-typed config field (source/destination).
+
+    Resolves the input via realpath/expanduser and checks existence. A
+    nonexistent path is allowed but requires explicit confirmation (default
+    no), since it may simply not have been created yet. Resolution failures
+    (e.g. invalid characters, embedded NUL bytes) are caught and re-prompted
+    instead of crashing the menu.
+
+    Returns the resolved path string to assign, or None if the field should
+    be left unchanged (empty input, or declined confirmation on a missing
+    path) — both cases are treated identically, per spec.
+    """
+    while True:
+        v = input(f"New {label} [{current}]: ").strip()
+        if not v:
+            return None
+        try:
+            resolved = os.path.realpath(os.path.expanduser(v))
+        except (OSError, ValueError) as e:
+            cprint(f"[✗] Invalid path: {e}", Colors.RED)
+            continue
+        if not Path(resolved).exists():
+            cprint(f"[!] This path does not exist: {resolved}", Colors.YELLOW)
+            confirm = input("Save it anyway? (y/n) [n]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                return None
+        return resolved
 
 
 def run_config_menu(config):
@@ -253,7 +288,8 @@ def run_config_menu(config):
         print("  [2] Destination path")
         print("  [3] Delete orphan files")
         print("  [4] Enable auto-backup before sync")
-        print("  [5] Manage ignored patterns")
+        print("  [5] Backup mode (full / focus)")
+        print("  [6] Manage ignored patterns")
         print("  [0] Back")
         print()
 
@@ -268,14 +304,14 @@ def run_config_menu(config):
 
         try:
             if choice == "1":
-                v = input(f"New source path [{config['source']}]: ").strip()
-                if v:
-                    config["source"] = os.path.realpath(os.path.expanduser(v))
+                v = _prompt_config_path(config["source"], "source path")
+                if v is not None:
+                    config["source"] = v
                     changed = True
             elif choice == "2":
-                v = input(f"New destination path [{config['destination']}]: ").strip()
-                if v:
-                    config["destination"] = os.path.realpath(os.path.expanduser(v))
+                v = _prompt_config_path(config["destination"], "destination path")
+                if v is not None:
+                    config["destination"] = v
                     changed = True
             elif choice == "3":
                 cur = "Yes" if config["delete_orphans"] else "No"
@@ -296,6 +332,28 @@ def run_config_menu(config):
                     config["backup_before_sync"] = False
                     changed = True
             elif choice == "5":
+                cprint(f"\nCurrent backup mode: {config['backup_mode']}", Colors.GREY)
+                print("  [1] full")
+                print("  [2] focus")
+                print("  [0] Cancel")
+                try:
+                    sub = input("Choice: ").strip()
+                except KeyboardInterrupt:
+                    print()
+                    continue
+                if sub == "1":
+                    config["backup_mode"] = "full"
+                    changed = True
+                    cprint("[✓] Backup mode set to 'full'.", Colors.GREEN)
+                elif sub == "2":
+                    config["backup_mode"] = "focus"
+                    changed = True
+                    cprint("[✓] Backup mode set to 'focus'.", Colors.GREEN)
+                elif sub == "0":
+                    pass
+                else:
+                    cprint("[?] Invalid choice.", Colors.GREY)
+            elif choice == "6":
                 print("\nCurrent patterns:", ", ".join(config["ignore_patterns"]))
                 print("  [a] Add a pattern")
                 print("  [r] Remove a pattern")
@@ -395,21 +453,56 @@ def should_ignore(path_str, ignore_patterns):
     )
 
 
-def _safe_walk(root):
+def _scan_tree(dir_path, ignore_patterns, rel_prefix=""):
     """
-    Recursively yield regular files under root.
-    Symlinks are skipped to avoid following loops or unintended targets.
-    Directories that raise PermissionError are skipped silently rather
-    than aborting the entire scan.
+    Recursively yield (full_path, stat_result, rel) for every regular file
+    under dir_path, using os.scandir instead of Path.iterdir() + separate
+    is_*()/stat() calls.
+
+    Each os.DirEntry caches type information from the underlying readdir()
+    call (d_type on most POSIX systems, a native cache on Windows), so
+    is_symlink()/is_dir()/is_file() are answered without a fresh stat() per
+    property. The single entry.stat() taken here for regular files is the
+    same stat() reused by the caller for size/mtime — never a second,
+    redundant stat() call.
+
+    Symlinks are skipped entirely (strict, unchanged behavior) before any
+    stat() is attempted, so a broken symlink or one pointing at a directory
+    never reaches stat(). Directories that raise PermissionError on
+    os.scandir() are skipped silently rather than aborting the whole scan.
+
+    Directory pruning: a directory is not descended into if its own
+    relative path already matches ignore_patterns (via should_ignore(),
+    same fnmatch-per-component logic used for files). This is a pure
+    speed optimization, not a behavior change — should_ignore() checks
+    EVERY component of a path, so any file underneath a matched directory
+    would already have that matched component in its own path and would
+    have been filtered out downstream anyway. Pruning just skips the
+    os.scandir() work of walking into directories like node_modules,
+    .git, dist, build, __pycache__, .cache before throwing their
+    contents away.
     """
     try:
-        for entry in root.iterdir():
-            if entry.is_symlink():
-                continue
-            if entry.is_dir():
-                yield from _safe_walk(entry)
-            elif entry.is_file():
-                yield entry
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
+                    if entry.is_dir():
+                        if should_ignore(rel, ignore_patterns):
+                            continue  # pruned — no file below can escape this filter anyway
+                        yield from _scan_tree(entry.path, ignore_patterns, rel)
+                    elif entry.is_file():
+                        try:
+                            st = entry.stat()
+                        except OSError:
+                            # Race: file vanished between scandir() and stat().
+                            continue
+                        yield entry.path, st, rel
+                except OSError:
+                    # Race: entry vanished before its type could be queried.
+                    continue
     except PermissionError:
         pass
 
@@ -451,27 +544,28 @@ def collect_files(root_dir, ignore_patterns, ext_filter=None):
     Hash values are NOT computed here — they are populated on demand by
     _files_differ() to avoid reading files that haven't changed.
     ext_filter: list of lowercase extensions to keep (e.g. ['.jsx', '.css']).
+
+    _scan_tree() already prunes ignored directories during the walk, but
+    should_ignore() is still applied here to each file's own relative
+    path — a file's own name can match a pattern (*.log,
+    package-lock.json, .DS_Store, ...) independently of any directory
+    it lives in, and that check isn't covered by directory pruning.
     """
     root  = Path(root_dir)
     files = {}
     if not root.exists():
         return files
 
-    for fpath in _safe_walk(root):
-        rel = fpath.relative_to(root).as_posix()
+    for full_path, st, rel in _scan_tree(str(root), ignore_patterns):
         if should_ignore(rel, ignore_patterns):
             continue
-        if ext_filter and fpath.suffix.lower() not in ext_filter:
-            continue
-        try:
-            st = fpath.stat()
-        except OSError:
+        if ext_filter and Path(full_path).suffix.lower() not in ext_filter:
             continue
         files[rel] = {
             "size":      st.st_size,
             "mtime_raw": st.st_mtime,
             "mtime":     datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d  %H:%M:%S"),
-            "full":      str(fpath),
+            "full":      full_path,
         }
     return files
 
@@ -479,6 +573,69 @@ def collect_files(root_dir, ignore_patterns, ext_filter=None):
 # ─────────────────────────────────────────────────────────────────
 #  CHANGE DETECTION
 # ─────────────────────────────────────────────────────────────────
+def _max_hash_workers():
+    """
+    Bound the hashing thread pool.
+
+    Termux/Android often runs on constrained hardware, over shared
+    storage with FUSE overhead — cap harder there via TERMUX_VERSION
+    detection. Elsewhere, hashing is I/O-bound (disk reads) and
+    hashlib's OpenSSL backend releases the GIL on large chunks, so
+    real parallelism is achieved with threads; oversubscribing cores
+    (2x) helps hide read latency, capped at 16 to avoid exhausting
+    file descriptors on very large trees.
+    """
+    is_termux = bool(os.environ.get("TERMUX_VERSION"))
+    base = os.cpu_count() or 2
+    return 4 if is_termux else min(16, base * 2)
+
+
+def _prehash_candidates(common, src_files, dst_files):
+    """
+    Warm the per-entry hash cache for every same-size candidate pair in
+    `common`, in parallel, before the sequential comparison passes run.
+
+    Pass 1 (no I/O): a pair whose sizes already differ is already known
+    to be "different" — no hash is needed, so it's skipped here
+    entirely. This preserves the existing lazy-hashing rule: only
+    same-size pairs ever get hashed.
+
+    Pass 2 (bounded parallel I/O): every entry that still needs a hash
+    is collected into a dict keyed by id(entry) — using the entry
+    object's identity (not its path) guarantees each physical file is
+    submitted to the pool at most once, even if it were reachable from
+    more than one candidate pair. Each task calls the existing
+    file_hash(), which already returns None on any read error instead
+    of raising, so no exception can escape a task.
+
+    After this returns, _files_differ() runs normally in sequence and
+    always finds a warm cache (entry["hash"] already set) — its
+    behavior, its return value, and the caller-visible output of
+    detect_changes() are all unchanged. Only *when* each hash gets
+    computed has changed, not *whether* or *how many times*.
+    """
+    candidates = {}
+    for rel in common:
+        s, d = src_files[rel], dst_files[rel]
+        if s["size"] != d["size"]:
+            continue  # size alone already proves "different" — no hash needed
+        candidates[id(s)] = s
+        candidates[id(d)] = d
+
+    if not candidates:
+        return  # nothing to hash — pool is never created, zero overhead
+
+    def _hash_entry(entry):
+        entry["hash"] = file_hash(entry["full"])
+
+    with ThreadPoolExecutor(max_workers=_max_hash_workers()) as ex:
+        # list() forces full consumption so the `with` block's clean
+        # shutdown/join happens only after every task has completed —
+        # including on Ctrl+C, where the context manager still waits
+        # for in-flight tasks before the KeyboardInterrupt propagates.
+        list(ex.map(_hash_entry, candidates.values()))
+
+
 def detect_changes(src_files, dst_files, direction="src"):
     """
     Compare src_files and dst_files according to the sync direction.
@@ -487,6 +644,13 @@ def detect_changes(src_files, dst_files, direction="src"):
         'src'   → source is authoritative  (src → dst)
         'dst'   → destination is authoritative (dst → src)
         'smart' → newest file on either side wins (bidirectional)
+
+    Before the per-direction comparison below, _prehash_candidates()
+    pre-populates the hash cache for every common, same-size pair in a
+    bounded thread pool. This is a pure speed optimization: the
+    sequential _files_differ() calls that follow are unchanged and
+    simply find the cache already warm, so the returned to_copy /
+    to_delete are identical to the fully-sequential implementation.
 
     Returns:
         to_copy   : dict of files to copy, keyed by relative path
@@ -497,6 +661,8 @@ def detect_changes(src_files, dst_files, direction="src"):
     common    = src_set & dst_set
     to_copy   = {}
     to_delete = []
+
+    _prehash_candidates(common, src_files, dst_files)
 
     if direction == "src":
         for rel in sorted(src_set - dst_set):
@@ -701,24 +867,211 @@ def pick_files(to_copy, to_delete):
 # ─────────────────────────────────────────────────────────────────
 #  BACKUP
 # ─────────────────────────────────────────────────────────────────
-def create_backup(path):
+
+# Characters invalid in Windows filenames — also stripped on other
+# platforms for a single, predictable naming convention everywhere.
+_INVALID_NAME_CHARS = '<>:"/\\|?*'
+
+
+def backup_root_dir():
     """
-    Copy the target directory to a timestamped backup folder.
-    Microseconds are included in the timestamp to handle rapid successive
-    calls (e.g. watch mode with a 1-second interval).
+    Centralized root for all backups (full and, later, focus), placed
+    under CONFIG_DIR rather than as a sibling of the backed-up target.
+
+    CONFIG_DIR already carries the Termux/shared-storage detection
+    (_in_shared) used for the config and lock files, so centralizing
+    backups here makes them Termux-safe for free, with no new FUSE
+    detection logic to write or keep in sync.
+    """
+    root = CONFIG_DIR / "dirsync_backups"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _sanitize_project_name(name):
+    """Replace characters invalid in Windows filenames with '_'."""
+    for ch in _INVALID_NAME_CHARS:
+        name = name.replace(ch, "_")
+    return name
+
+
+def _backup_name(target_path, mode, direction):
+    """
+    Build a backup folder name following the shared full/focus convention:
+        {project}_{mode}_{direction}_{YYYYMMDD_HHMMSS_ffffff}
+
+    Microseconds are included so rapid successive calls (e.g. watch mode)
+    never collide on the same name.
+    """
+    project = _sanitize_project_name(Path(target_path).name)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{project}_{mode}_{direction}_{ts}"
+
+
+def _write_backup_meta(backup_dir, mode, direction, original_path, source, destination):
+    """
+    Write the .dirsync_meta.json sidecar at the root of a backup folder.
+
+    Uses the same atomic temp-file + os.replace() pattern as save_config()
+    to avoid ever leaving a half-written metadata file behind.
+    """
+    meta = {
+        "mode":              mode,
+        "direction":         direction,
+        "original_path":     str(original_path),
+        "created_at":        datetime.now().isoformat(),
+        "config_source":     str(source),
+        "config_destination": str(destination),
+    }
+    meta_path = backup_dir / ".dirsync_meta.json"
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=backup_dir, prefix=".dirsync_meta_tmp_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, meta_path)
+    except (IOError, OSError) as e:
+        cprint(f"[!] Could not write backup metadata: {e}", Colors.YELLOW)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def create_full_backup(path, direction, source, destination):
+    """
+    Copy the entire target directory tree under the centralized backup
+    root, using the shared naming convention, then write the metadata
+    sidecar. Replaces the old create_backup() for the "full" backup mode.
     """
     p = Path(path)
     if not p.exists():
         return None
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    backup = p.parent / f"{p.name}_backup_{ts}"
+    try:
+        root = backup_root_dir()
+    except OSError as e:
+        cprint(f"[✗] Backup failed: could not create backup root ({e})", Colors.RED)
+        return None
+    backup = root / _backup_name(p, "full", direction)
     try:
         shutil.copytree(str(p), str(backup))
+        _write_backup_meta(backup, "full", direction, p, source, destination)
         cprint(f"[✓] Backup created: {backup}", Colors.CYAN)
         return backup
     except Exception as e:
         cprint(f"[✗] Backup failed: {e}", Colors.RED)
         return None
+
+
+def _focus_risk_files(to_copy, to_delete, direction, src_root, dst_root, delete_orphans):
+    """
+    Build the list of (kind, rel, current_path) files this sync pass is
+    about to overwrite or delete — the exact set a "focus" backup must
+    protect before apply_sync() runs.
+
+    "new" to_copy entries are excluded: nothing exists yet at their
+    target, so there is nothing to protect. The target path for a
+    "modified" entry is resolved with the same _resolve_copy_target()
+    apply_sync() itself uses (including the winner/loser resolution
+    for "smart" direction), so the file backed up here is guaranteed
+    to be exactly the one about to be overwritten — any divergence
+    from apply_sync()'s own resolution would silently protect the
+    wrong file.
+
+    to_delete entries are only included when delete_orphans is active
+    (ref_root mirrors apply_sync()'s own delete-phase root selection)
+    — otherwise those files won't actually be removed this pass, so
+    they aren't at risk.
+    """
+    risk = []
+    for rel, v in to_copy.items():
+        if "new" in v["tag"]:
+            continue
+        target = _resolve_copy_target(rel, v, direction, src_root, dst_root)
+        risk.append(("copy", rel, target))
+    if delete_orphans:
+        ref_root = dst_root if direction in ("src", "smart") else src_root
+        for rel in to_delete:
+            risk.append(("delete", rel, ref_root / rel))
+    return risk
+
+
+def create_focus_backup(source, destination, to_copy, to_delete,
+                         direction, delete_orphans):
+    """
+    Back up only the files actually at risk in this sync pass, each
+    preserved at its exact original relative path under the backup
+    root (a faithful subtree, not a flat dump) — see
+    _focus_risk_files() for exactly which files qualify.
+
+    Safety policy: unlike create_full_backup() (all-or-nothing), a
+    failure backing up one specific file never aborts the whole
+    backup. That file is instead pulled out of to_copy/to_delete
+    before returning, so apply_sync() can never overwrite or delete
+    the only existing copy of a file that failed to be saved. The
+    caller (run_sync) derives the backup-failure error count itself
+    by comparing the returned, filtered to_copy/to_delete against the
+    originals it passed in — this keeps this function's return shape
+    exactly the 3-tuple specified, while still surfacing every backup
+    failure as a counted error in the final report.
+
+    Each individual file copy uses _copy_atomic() unmodified — but
+    sequentially, not through the ticket-3 copy pool: a backup step is
+    a reliability operation, not a speed one, and staying sequential
+    here keeps this first cut of "focus" simple to reason about.
+
+    Root-level failures (backup root itself can't be created — e.g. a
+    read-only CONFIG_DIR) are treated like create_full_backup(): a
+    warning is printed and the sync proceeds with to_copy/to_delete
+    unchanged, rather than retiring every at-risk file. Retiring
+    everything would effectively block the whole sync on a single
+    infrastructure failure, which contradicts the "never block a sync
+    over a failed backup" behavior already established for "full".
+
+    Returns (backup_path_or_None, filtered_to_copy, filtered_to_delete).
+    """
+    src_root = Path(source)
+    dst_root = Path(destination)
+
+    risk = _focus_risk_files(to_copy, to_delete, direction, src_root, dst_root, delete_orphans)
+    if not risk:
+        cprint("[i] No existing files to back up — backup skipped.", Colors.GREY)
+        return None, to_copy, to_delete
+
+    try:
+        root = backup_root_dir()
+    except OSError as e:
+        cprint(f"[✗] Backup failed: could not create backup root ({e})", Colors.RED)
+        return None, to_copy, to_delete
+
+    # Naming/metadata mirror create_full_backup()'s own target selection:
+    # the destination is the primary target for "src"/"smart", the
+    # source for "dst" — same rule run_sync() already uses to pick
+    # target_backup for the "full" mode call.
+    target_root = destination if direction in ("src", "smart") else source
+    backup = root / _backup_name(target_root, "focus", direction)
+
+    failed_copy   = set()
+    failed_delete = set()
+    for kind, rel, current_path in risk:
+        dst_file = backup / rel
+        try:
+            _copy_atomic(current_path, dst_file)
+        except Exception as e:
+            cprint(f"[✗] Focus backup failed for {rel}: {e}", Colors.RED)
+            if kind == "copy":
+                failed_copy.add(rel)
+            else:
+                failed_delete.add(rel)
+
+    _write_backup_meta(backup, "focus", direction, target_root, source, destination)
+    cprint(f"[✓] Backup created: {backup}", Colors.CYAN)
+
+    filtered_to_copy   = {rel: v for rel, v in to_copy.items() if rel not in failed_copy}
+    filtered_to_delete = [rel for rel in to_delete if rel not in failed_delete]
+
+    return backup, filtered_to_copy, filtered_to_delete
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -730,6 +1083,11 @@ def _copy_atomic(src, dst):
     Writes into a sibling temp file, then renames it into place via
     os.replace(). This means a partial file never appears at the
     final destination path, even if the process is interrupted mid-copy.
+
+    Already thread-safe as-is: tempfile.mkstemp() hands out a unique
+    path per call, so concurrent callers (the copy pool below) never
+    collide on the same temp file, and os.replace() is atomic per
+    destination path.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dst.parent)
@@ -745,44 +1103,107 @@ def _copy_atomic(src, dst):
         raise
 
 
+def _max_copy_workers():
+    """
+    Bound the copy thread pool.
+
+    Copying is write I/O bound (disk writes at the destination), unlike
+    hashing's read-bound workload, so it gets its own — slightly lower —
+    ceiling: min(12, base * 2) instead of hashing's min(16, base * 2).
+    Termux/Android keeps the same hard cap of 4 as hashing, for the same
+    constrained-hardware / FUSE-overhead reasons documented on
+    _max_hash_workers().
+    """
+    is_termux = bool(os.environ.get("TERMUX_VERSION"))
+    base = os.cpu_count() or 2
+    return 4 if is_termux else min(12, base * 2)
+
+
+def _resolve_copy_target(rel, v, direction, src_root, dst_root):
+    """
+    Resolve the destination path for one to_copy entry.
+
+    Identical logic to what apply_sync used to compute inline before
+    parallelization — factored out only so the parallel copy task below
+    can call it per-entry, inside its own thread, with no shared state.
+    """
+    if direction == "src":
+        return dst_root / rel
+    elif direction == "dst":
+        return src_root / rel
+    elif direction == "smart":
+        winner = v.get("winner", "source")
+        return dst_root / rel if winner == "source" else src_root / rel
+    else:
+        return dst_root / rel
+
+
 def apply_sync(source, destination, to_copy, to_delete,
                direction="src", delete_orphans=False, dry_run=False):
     """
     Apply the selected file changes.
     Returns (success_count, error_count).
+
+    Copy phase (to_copy): parallelized on a bounded thread pool (see
+    _max_copy_workers()) when not in dry-run mode. Each task resolves
+    its own destination and calls the existing _copy_atomic()
+    unmodified, then returns a (ok, error_message) result instead of
+    touching a shared counter — success/error counts are aggregated
+    sequentially after every future has resolved, so there is no race
+    on the counters and no lock is needed. Progress lines are still
+    printed one file at a time (one cprint() call per line), but the
+    order they appear in is no longer guaranteed to match the order of
+    the to_copy dict, since copies now finish asynchronously. The
+    ThreadPoolExecutor is used as a context manager so a Ctrl+C during
+    copying still waits for in-flight tasks to finish/join cleanly
+    before the interrupt propagates — no partial file can ever land at
+    a final destination path, since that guarantee lives in
+    _copy_atomic() itself and is untouched here.
+
+    Delete phase (to_delete): stays strictly sequential, unchanged —
+    orphan deletion is irreversible, so it is deliberately kept out of
+    the parallel path regardless of backup_mode or file count.
+
+    --dry-run: stays strictly sequential too (no writes happen, so
+    there's no perf to gain), which also keeps its output order
+    identical to the pre-parallelization implementation.
     """
     src_root = Path(source)
     dst_root = Path(destination)
     label    = "[DRY-RUN] " if dry_run else ""
     success  = errors = 0
 
-    for rel, v in to_copy.items():
-        frm   = Path(v["from"])
-        tag   = v.get("tag", "modified")
-        sym   = "+" if "new" in tag else "~"
-        color = Colors.GREEN if sym == "+" else Colors.YELLOW
+    if dry_run:
+        for rel, v in to_copy.items():
+            tag   = v.get("tag", "modified")
+            sym   = "+" if "new" in tag else "~"
+            color = Colors.GREEN if sym == "+" else Colors.YELLOW
+            cprint(f"  {label}[{sym}] {rel}", color)
+            success += 1
 
-        if direction == "src":
-            dst_file = dst_root / rel
-        elif direction == "dst":
-            dst_file = src_root / rel
-        elif direction == "smart":
-            winner   = v.get("winner", "source")
-            dst_file = dst_root / rel if winner == "source" else src_root / rel
-        else:
-            dst_file = dst_root / rel
-
-        cprint(f"  {label}[{sym}] {rel}", color)
-
-        if not dry_run:
+    elif to_copy:
+        def _copy_task(item):
+            rel, v   = item
+            frm      = Path(v["from"])
+            tag      = v.get("tag", "modified")
+            sym      = "+" if "new" in tag else "~"
+            color    = Colors.GREEN if sym == "+" else Colors.YELLOW
+            dst_file = _resolve_copy_target(rel, v, direction, src_root, dst_root)
             try:
                 _copy_atomic(frm, dst_file)
-                success += 1
+                cprint(f"  [{sym}] {rel}", color)
+                return True, None
             except Exception as e:
+                cprint(f"  [{sym}] {rel}", color)
                 cprint(f"       [✗] Error: {e}", Colors.RED)
-                errors += 1
-        else:
-            success += 1
+                return False, str(e)
+
+        with ThreadPoolExecutor(max_workers=_max_copy_workers()) as ex:
+            for ok, _err in ex.map(_copy_task, to_copy.items()):
+                if ok:
+                    success += 1
+                else:
+                    errors += 1
 
     if delete_orphans:
         ref_root = dst_root if direction in ("src", "smart") else src_root
@@ -827,8 +1248,412 @@ def write_log(source, destination, direction, success, errors, copied, deleted):
 
 
 # ─────────────────────────────────────────────────────────────────
+#  BACKUP MANAGER — LISTING & RESTORE
+# ─────────────────────────────────────────────────────────────────
+
+# Sidecar filename is excluded from every backup-vs-target scan below —
+# it is dirsync's own bookkeeping, written *after* the tree it describes,
+# and must never be treated as a file to restore.
+_BACKUP_META_NAME = ".dirsync_meta.json"
+
+
+def _read_backup_meta(backup_dir):
+    """
+    Read and validate the .dirsync_meta.json sidecar for one backup folder.
+
+    Returns the parsed dict, or None if the sidecar is missing, corrupt,
+    or missing a required key. Callers must treat None as "unrecognized
+    backup, restoration disabled" per the ticket — never as a reason to
+    skip or delete the folder from the listing.
+    """
+    meta_path = backup_dir / _BACKUP_META_NAME
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+    if not all(k in meta for k in ("mode", "direction", "original_path", "created_at")):
+        return None
+    if meta["mode"] not in ("full", "focus"):
+        return None
+    return meta
+
+
+def _count_backup_files(backup_dir):
+    """Count regular files under backup_dir, excluding the meta sidecar."""
+    count = 0
+    for _, _, files in os.walk(str(backup_dir)):
+        count += sum(1 for f in files if f != _BACKUP_META_NAME)
+    return count
+
+
+def _list_backups():
+    """
+    Scan backup_root_dir() and return one entry per subfolder:
+        {"dir": Path, "meta": dict_or_None, "file_count": int}
+
+    Sorted by created_at descending. Folders without valid metadata sort
+    last (empty-string sort key) but are always included — they are
+    never silently ignored or deleted, only flagged as
+    restoration-disabled by the caller.
+    """
+    root = backup_root_dir()
+    entries = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        meta = _read_backup_meta(child)
+        entries.append({
+            "dir":         child,
+            "meta":        meta,
+            "file_count":  _count_backup_files(child),
+        })
+    entries.sort(key=lambda e: e["meta"]["created_at"] if e["meta"] else "", reverse=True)
+    return entries
+
+
+def _print_backups_list(entries):
+    print_section("Available backups")
+    if not entries:
+        cprint("[i] No backups found.", Colors.GREY)
+        print()
+        return
+    for i, e in enumerate(entries, 1):
+        meta = e["meta"]
+        if meta is None:
+            cprint(f"  [{i:2d}] {e['dir'].name}", Colors.GREY)
+            cprint("       ⚠ Missing/corrupted metadata — restore disabled.", Colors.YELLOW)
+        else:
+            cprint(f"  [{i:2d}] {meta['mode']:5s} | {meta['direction']:6s} | {e['file_count']} file(s)",
+                   Colors.CYAN, bold=True)
+            cprint(f"       Original : {meta['original_path']}", Colors.GREY)
+            cprint(f"       Created  : {meta['created_at']}", Colors.GREY)
+        print()
+
+
+def _prompt_restore_target(original_path):
+    """
+    Ask where to restore to: the backup's recorded original location, or
+    a manually entered folder. The resolved absolute path of the
+    original location is shown up front — this is what surfaces a
+    config that changed since the backup was made, before any
+    destructive confirmation happens.
+
+    Returns the resolved target Path. Raises UserCancelled on decline,
+    invalid input, or Ctrl+C.
+    """
+    resolved_original = os.path.realpath(os.path.expanduser(original_path))
+    print(f"  [1] Original location : {resolved_original}")
+    print("  [2] Other folder (enter manually)")
+    print("  [0] Cancel")
+    try:
+        choice = input("Choice: ").strip()
+    except KeyboardInterrupt:
+        print()
+        raise UserCancelled("Restore cancelled.")
+
+    if choice == "1":
+        return Path(resolved_original)
+    elif choice == "2":
+        try:
+            raw = input("Target folder path: ").strip()
+        except KeyboardInterrupt:
+            print()
+            raise UserCancelled("Restore cancelled.")
+        if not raw:
+            raise UserCancelled("Restore cancelled.")
+        try:
+            return Path(os.path.realpath(os.path.expanduser(raw)))
+        except (OSError, ValueError) as e:
+            cprint(f"[✗] Invalid path: {e}", Colors.RED)
+            raise UserCancelled("Restore cancelled.")
+    else:
+        raise UserCancelled("Restore cancelled.")
+
+
+def _ensure_restore_target(target):
+    """
+    Mirror run_sync()'s missing-directory handling for the restore
+    target: if it doesn't exist yet, offer to create it after explicit
+    confirmation. Raises UserCancelled if declined or creation fails.
+    """
+    if target.exists():
+        return
+    cprint(f"[?] This folder doesn't exist: {target}", Colors.YELLOW)
+    try:
+        rep = input("    Create it? (y/n): ").strip().lower()
+    except KeyboardInterrupt:
+        print()
+        raise UserCancelled("Restore cancelled.")
+    if rep not in ("y", "yes"):
+        raise UserCancelled("Restore cancelled.")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        cprint("[✓] Folder created.", Colors.GREEN)
+    except OSError as e:
+        cprint(f"[✗] Could not create folder: {e}", Colors.RED)
+        raise UserCancelled("Restore cancelled.")
+
+
+def _confirm_restore():
+    """
+    Two-stage confirmation required before any restore write happens: a
+    standard y/n (right after the change report), then a literal typed
+    'RESTORE' — not just 'y' — given how destructive this operation can
+    be, especially a "full" restore forcing delete_orphans=True.
+    Raises UserCancelled on any decline, mismatch, or Ctrl+C.
+    """
+    try:
+        rep = input("Apply these changes? (y/n): ").strip().lower()
+    except KeyboardInterrupt:
+        print()
+        raise UserCancelled("Restore cancelled.")
+    if rep not in ("y", "yes"):
+        raise UserCancelled("Restore cancelled.")
+
+    print()
+    cprint("Type RESTORE (uppercase) to confirm permanently:", Colors.RED, bold=True)
+    try:
+        typed = input("➜ ").strip()
+    except KeyboardInterrupt:
+        print()
+        raise UserCancelled("Restore cancelled.")
+    if typed != "RESTORE":
+        raise UserCancelled("Restore cancelled (invalid confirmation).")
+    print()
+
+
+def _restore_full(entry, target, ensure_lock):
+    """
+    Restore a "full" backup as a classic sync where the backup plays the
+    role of source: collect_files(backup) vs collect_files(target),
+    detect_changes(direction="src"), print_report(), then apply_sync()
+    with delete_orphans forced True. Reusing this exact pipeline means
+    the restore automatically gets ticket 3's parallel copy pool and,
+    critically, the same _mass_deletion_guard_triggered() check a normal
+    sync relies on — a backup that looks suspiciously empty refuses to
+    wipe out a target that still has files, exactly like a normal sync
+    would refuse on an unavailable source.
+
+    Note (flagged, not an architecture call): only the meta sidecar is
+    excluded from the scan on both sides. No other ignore_patterns are
+    applied — a "full" restore reproduces exactly what was physically
+    backed up (create_full_backup() used a raw shutil.copytree(), not
+    filtered scanning), regardless of the *current* ignore_patterns
+    config, which may have changed since the backup was made.
+    """
+    backup_dir = entry["dir"]
+    ignore = [_BACKUP_META_NAME]
+
+    cprint("Scanning backup...", Colors.CYAN)
+    backup_files = collect_files(str(backup_dir), ignore)
+    target_files = collect_files(str(target), ignore)
+    cprint(f"  Backup : {len(backup_files)} file(s)", Colors.GREY)
+    cprint(f"  Target : {len(target_files)} file(s)", Colors.GREY)
+    print()
+
+    to_copy, to_delete = detect_changes(backup_files, target_files, direction="src")
+
+    if _mass_deletion_guard_triggered(backup_files, target_files, True, "src"):
+        cprint("[!] The backup appears empty while the target has files.", Colors.YELLOW)
+        cprint("[!] Refusing to restore to avoid a mass deletion at the target.", Colors.RED)
+        raise UserCancelled("Restore cancelled (anti mass-deletion guard).")
+
+    has_changes = print_report(to_copy, to_delete, "src", True, backup_files, target_files)
+    if not has_changes:
+        cprint("[i] Nothing to restore — the target already matches the backup.", Colors.GREY)
+        return
+
+    _confirm_restore()
+
+    if not ensure_lock():
+        cprint("[✗] Another dirsync instance is already running.", Colors.RED)
+        cprint(f"    Remove the lock file if this is wrong: {LOCK_FILE}", Colors.GREY)
+        raise UserCancelled("Restore cancelled (lock active).")
+
+    print_section("Restoring (full)...")
+    success, errors = apply_sync(
+        str(backup_dir), str(target), to_copy, to_delete,
+        direction="src", delete_orphans=True, dry_run=False,
+    )
+    print()
+    if errors == 0:
+        cprint(f"[✓] Restore complete — {success} operation(s).", Colors.GREEN, bold=True)
+    else:
+        cprint(f"[~] Restore complete — {success} succeeded, {errors} error(s).", Colors.YELLOW, bold=True)
+
+
+def _restore_focus(entry, target, ensure_lock):
+    """
+    Restore a "focus" backup: overwrite-only, never deletes.
+
+    Deliberately NOT routed through apply_sync(delete_orphans=True) —
+    each file physically present in the backup is copied via
+    _copy_atomic() straight to its matching relative path under target,
+    in a dedicated loop. This keeps the "focus never deletes" guarantee
+    structurally impossible to confuse with the "full" path above,
+    rather than relying on a caller always remembering to pass
+    delete_orphans=False.
+    """
+    backup_dir = entry["dir"]
+    ignore = [_BACKUP_META_NAME]
+
+    cprint("Scanning backup...", Colors.CYAN)
+    backup_files = collect_files(str(backup_dir), ignore)
+    target_files = collect_files(str(target), ignore)
+    cprint(f"  Backup : {len(backup_files)} file(s)", Colors.GREY)
+    print()
+
+    # Shaped like detect_changes()'s direction="src" output purely to
+    # reuse print_report() for the confirmation summary. No to_delete is
+    # ever built: a focus restore never removes anything at the target,
+    # regardless of what's missing there relative to the backup.
+    to_copy = {}
+    for rel, info in backup_files.items():
+        if rel in target_files:
+            to_copy[rel] = {
+                "from": info["full"], "tag": "modified",
+                "src_info": info, "dst_info": target_files[rel],
+            }
+        else:
+            to_copy[rel] = {"from": info["full"], "tag": "new", "info": info}
+
+    has_changes = print_report(to_copy, [], "src", False, backup_files, target_files)
+    if not has_changes:
+        cprint("[i] Nothing to restore — the target already matches the backup.", Colors.GREY)
+        return
+
+    _confirm_restore()
+
+    if not ensure_lock():
+        cprint("[✗] Another dirsync instance is already running.", Colors.RED)
+        cprint(f"    Remove the lock file if this is wrong: {LOCK_FILE}", Colors.GREY)
+        raise UserCancelled("Restore cancelled (lock active).")
+
+    print_section("Restoring (focus — overwrite only)...")
+    success = errors = 0
+    for rel, info in backup_files.items():
+        dst_file = target / rel
+        try:
+            _copy_atomic(Path(info["full"]), dst_file)
+            cprint(f"  [~] {rel}", Colors.YELLOW)
+            success += 1
+        except Exception as e:
+            cprint(f"  [~] {rel}", Colors.YELLOW)
+            cprint(f"       [✗] Error: {e}", Colors.RED)
+            errors += 1
+    print()
+    if errors == 0:
+        cprint(f"[✓] Restore complete — {success} file(s) restored.", Colors.GREEN, bold=True)
+    else:
+        cprint(f"[~] Restore complete — {success} succeeded, {errors} error(s).", Colors.YELLOW, bold=True)
+
+
+def _restore_backup(entry, ensure_lock):
+    """Resolve the target and dispatch to the mode-specific restore path."""
+    meta = entry["meta"]
+    print_section(f"Restore — {meta['mode']} / {meta['direction']}")
+    target = _prompt_restore_target(meta["original_path"])
+    _ensure_restore_target(target)
+    print()
+    if meta["mode"] == "full":
+        _restore_full(entry, target, ensure_lock)
+    else:
+        _restore_focus(entry, target, ensure_lock)
+
+
+def run_backup_manager():
+    """
+    Interactive backup listing/restoration manager, entered via
+    --backups — independent of the normal sync flow (main() branches
+    here before any direction prompt, path validation, or run_sync
+    call).
+
+    The PID lock is acquired lazily, only right before the first actual
+    restore write in this session (not just for browsing/listing), and
+    then held for the rest of the process — mirroring how main() itself
+    acquires the lock once per process lifetime rather than per
+    operation. acquire_lock() would otherwise refuse its own second call
+    within the same still-running process (the lock file would contain
+    our own, still-alive PID), so a local flag prevents re-acquiring
+    what this session already holds.
+    """
+    lock_held = [False]
+
+    def ensure_lock():
+        if lock_held[0]:
+            return True
+        if acquire_lock():
+            lock_held[0] = True
+            return True
+        return False
+
+    while True:
+        entries = _list_backups()
+        _print_backups_list(entries)
+        if not entries:
+            return
+
+        try:
+            raw = input("Backup number to restore (0 to cancel): ").strip()
+        except KeyboardInterrupt:
+            print()
+            return
+
+        if raw in ("", "0"):
+            return
+
+        try:
+            idx = int(raw)
+        except ValueError:
+            cprint("[?] Invalid input.", Colors.GREY)
+            print()
+            continue
+        if not (1 <= idx <= len(entries)):
+            cprint("[?] Number out of range.", Colors.GREY)
+            print()
+            continue
+
+        entry = entries[idx - 1]
+        if entry["meta"] is None:
+            cprint("[✗] This backup has no valid metadata — restore disabled.", Colors.RED)
+            print()
+            continue
+
+        try:
+            _restore_backup(entry, ensure_lock)
+        except UserCancelled as e:
+            cprint(f"[i] {e}", Colors.GREY)
+        print()
+
+
+# ─────────────────────────────────────────────────────────────────
 #  SINGLE SYNC PASS
 # ─────────────────────────────────────────────────────────────────
+def _mass_deletion_guard_triggered(src_files, dst_files, delete_orphans, direction):
+    """
+    Shared anti-mass-deletion guard.
+
+    Refuses to proceed when the source-side scan came back empty while
+    the destination-side scan still has files and delete_orphans is
+    active for a direction that would delete them — the source having
+    zero files is far more likely to mean "unavailable" (unmounted
+    drive, network share, or — for a restore — a mistakenly empty
+    backup folder) than "genuinely emptied on purpose".
+
+    Factored out of run_sync() (unchanged behavior/messages there) so
+    ticket 7's "full" backup restore, which is deliberately implemented
+    as a classic sync with the backup playing the role of source, can
+    call the exact same check instead of a re-implementation that could
+    silently drift from it over time.
+    """
+    return (not src_files and dst_files
+            and delete_orphans
+            and direction in ("src", "smart"))
+
+
 def run_sync(config, args):
     """
     Execute one full sync pass.
@@ -883,9 +1708,7 @@ def run_sync(config, args):
     # it likely means the source directory became unavailable (unmounted
     # drive, network share, etc.). Proceeding would delete everything in
     # the destination. Abort instead.
-    if (not src_files and dst_files
-            and config["delete_orphans"]
-            and direction in ("src", "smart")):
+    if _mass_deletion_guard_triggered(src_files, dst_files, config["delete_orphans"], direction):
         cprint("[!] Source appears empty but destination has files.", Colors.YELLOW)
         cprint("[!] Refusing to delete destination files from an empty source scan.", Colors.YELLOW)
         cprint("[!] Verify that the source directory is accessible.", Colors.RED)
@@ -932,10 +1755,24 @@ def run_sync(config, args):
         print()
 
     # Backup
+    backup_errors = 0
     if config["backup_before_sync"]:
         print_section("Creating backup...")
         target_backup = destination if direction in ("src", "smart") else source
-        create_backup(target_backup)
+        if config["backup_mode"] == "full":
+            create_full_backup(target_backup, direction, source, destination)
+        elif config["backup_mode"] == "focus":
+            # create_focus_backup() returns to_copy/to_delete with any
+            # entry it couldn't back up already removed — comparing
+            # counts before/after is how the caller learns how many
+            # backup failures happened, since the function's own return
+            # shape stays the 3-tuple the ticket specifies.
+            before_copy, before_delete = len(to_copy), len(to_delete)
+            _, to_copy, to_delete = create_focus_backup(
+                source, destination, to_copy, to_delete,
+                direction, config["delete_orphans"],
+            )
+            backup_errors = (before_copy - len(to_copy)) + (before_delete - len(to_delete))
         print()
 
     # Apply changes
@@ -944,6 +1781,10 @@ def run_sync(config, args):
         source, destination, to_copy, to_delete,
         direction, config["delete_orphans"], dry_run=False,
     )
+    # Files a focus backup couldn't protect were already removed from
+    # to_copy/to_delete above (never synced/deleted this pass), but the
+    # failure must still be counted and visible in the final report.
+    errors += backup_errors
 
     copied_count  = len(to_copy)
     deleted_count = len(to_delete) if config["delete_orphans"] else 0
@@ -964,6 +1805,69 @@ def run_sync(config, args):
 # ─────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────
+def _bare_invocation(args):
+    """
+    True when the CLI invocation carries none of the mode-selecting
+    flags — the only case where run_main_menu() (ticket 8) is shown.
+    Any of these flags preserves the exact pre-ticket-8 behavior: no
+    new menu, direct flow into the existing direction-prompt/run_sync
+    sequence in main().
+
+    --config is included per the ticket's own condition, but main()
+    already returns above before this function is ever called whenever
+    it's set (same for --backups, checked just above it) — listed here
+    only to document precedence, never the deciding factor at runtime.
+    """
+    return not (
+        args.auto or args.watch or args.config
+        or args.direction or args.pick or args.dry_run or args.ext
+    )
+
+
+def run_main_menu(config):
+    """
+    Interactive entry-point menu (ticket 8), shown only for a bare
+    invocation — see _bare_invocation(). Replaces the previous direct
+    fall-through from show_config() into the direction prompt; that
+    prompt (and run_sync) is untouched, just reached one step later.
+
+    Loops after [2] Settings or [3] Backup manager so the
+    user always lands back here — neither call can exit the process on
+    its own. Only [1] returns normally (falling through in main() to
+    the existing direction-prompt/run_sync flow, unchanged); [0] and
+    Ctrl+C both exit the whole process directly here, matching the
+    pattern already used for the direction prompt below.
+    """
+    while True:
+        print_section("Main menu")
+        print("  [1] Start a sync")
+        print("  [2] Settings")
+        print("  [3] Backup manager")
+        print("  [0] Quit")
+        print()
+        try:
+            choice = input("Choice: ").strip()
+        except KeyboardInterrupt:
+            print()
+            cprint("[✗] Interrupted. Goodbye.", Colors.YELLOW)
+            sys.exit(0)
+
+        if choice == "1":
+            return
+        elif choice == "2":
+            run_config_menu(config)
+            print()
+        elif choice == "3":
+            run_backup_manager()
+            print()
+        elif choice == "0":
+            cprint("Goodbye.", Colors.GREY)
+            sys.exit(0)
+        else:
+            cprint("[?] Invalid choice.", Colors.GREY)
+            print()
+
+
 def main():
     global _USE_COLOR
 
@@ -977,6 +1881,8 @@ def main():
                         help="Skip confirmation prompt (non-interactive)")
     parser.add_argument("--config",    action="store_true",
                         help="Open the settings menu")
+    parser.add_argument("--backups",   action="store_true",
+                        help="Open the backup browser/restore manager")
     parser.add_argument("--direction", choices=["src", "dst", "smart"], default=None,
                         help="src=Source→Dest (default), dst=Dest→Source, smart=bidirectional")
     parser.add_argument("--pick",      action="store_true",
@@ -1018,6 +1924,13 @@ def main():
         run_config_menu(config)
         return
 
+    # Backup browser/restore manager — independent of the sync flow
+    # entirely: no source/destination validation, no first-run wizard,
+    # no direction prompt. Precedence matches --config above.
+    if args.backups:
+        run_backup_manager()
+        return
+
     # Session-only path overrides — not persisted to config on disk
     if args.source:
         config["source"] = os.path.realpath(os.path.expanduser(args.source))
@@ -1029,6 +1942,15 @@ def main():
         config = first_run_wizard(config)
 
     show_config(config)
+
+    # New interactive main menu (ticket 8) — bare invocation only. Any
+    # of the mode-selecting flags checked by _bare_invocation() skips
+    # this entirely and falls straight through to the lock/direction
+    # prompt/run_sync sequence below, exactly as before this ticket.
+    # run_main_menu() only returns once the user picked [1] Start a
+    # sync; [2]/[3] loop internally, [0]/Ctrl+C exit(0).
+    if _bare_invocation(args):
+        run_main_menu(config)
 
     # Prevent two instances from running against the same config simultaneously
     if not acquire_lock():

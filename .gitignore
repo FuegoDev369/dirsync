@@ -1,23 +1,16 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Virtual environments
-venv/
-.venv/
-env/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-.vscode/
-.idea/
-*.swp
-
 # dirsync runtime files
 .dirsync_config.json
 .dirsync.log
-*_backup_*/
+.dirsync.lock
+dirsync_backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
