@@ -11,6 +11,8 @@ A zero-dependency, interactive file synchronizer for any two directories — no 
 - **Dry-run mode** — preview every change before anything is touched
 - **Manual file picking** — choose exactly which detected changes to apply
 - **Extension filtering** — sync only `.jsx`, `.css`, `.js`, etc.
+- **Path-aware ignore patterns** — plain names (`node_modules`) match anywhere in the tree; patterns with a `/` (`exports/projects`) match only that exact relative path
+- **Multi-pattern entry** — add several ignore patterns at once, comma-separated
 - **Watch mode** — re-sync automatically on an interval
 - **Full & focus backups** — snapshot the whole target tree, or only the files about to be overwritten/deleted, before every sync
 - **Backup browser & restore** — list past backups and restore any of them, with a two-step typed confirmation before anything destructive happens
@@ -78,7 +80,7 @@ python dirsync.py                          # interactive mode
 
 ```
 ╔═══════════════════════════════════════╗
-║      dirsync  v2.0.0  by FuegoDev     ║
+║      dirsync  v2.1.0  by FuegoDev     ║
 ║    Two-directory file synchronizer    ║
 ╚═══════════════════════════════════════╝
 

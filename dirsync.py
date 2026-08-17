@@ -35,7 +35,7 @@ Usage:
     python dirsync.py --help
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__  = "FuegoDev"
 __license__ = "MIT"
 
@@ -196,6 +196,17 @@ def load_config():
             # between the loaded config and DEFAULT_CONFIG.
             for key, val in DEFAULT_CONFIG.items():
                 config.setdefault(key, copy.deepcopy(val))
+            # Defensive check: a comma inside a stored pattern is almost
+            # certainly leftover corruption from the pre-TICKET-10 "Add a
+            # pattern" prompt, which never split multi-pattern input. This
+            # is informational only — the config on disk is never rewritten
+            # automatically; fixing it is left to explicit user action via
+            # the menu.
+            suspicious = [p for p in config["ignore_patterns"] if "," in p]
+            if suspicious:
+                cprint(f"[!] Suspicious ignore pattern(s) containing a comma: {', '.join(suspicious)}", Colors.YELLOW)
+                cprint("    These likely came from a previous multi-pattern entry that wasn't split.", Colors.YELLOW)
+                cprint("    Fix them via --config → [6] Manage ignored patterns.", Colors.YELLOW)
             return config
         except (json.JSONDecodeError, IOError) as e:
             cprint(f"[!] Corrupted config ({e}), using defaults.", Colors.YELLOW)
@@ -363,11 +374,26 @@ def run_config_menu(config):
                     print()
                     continue
                 if sub == "a":
-                    p = input("Pattern to add (e.g. *.tmp, test_*): ").strip()
-                    if p and p not in config["ignore_patterns"]:
-                        config["ignore_patterns"].append(p)
-                        cprint(f"[+] '{p}' added.", Colors.GREEN)
-                        changed = True
+                    print("Pattern(s) to add — separate multiple with commas.")
+                    print("Use '/' for an exact path (e.g. exports/projects), or a bare name")
+                    raw = input("to match anywhere (e.g. node_modules): ").strip()
+                    if raw:
+                        # A bare single-pattern entry (no comma) is just a
+                        # one-element list here — same code path, no special case.
+                        candidates = [p.strip() for p in raw.split(",")]
+                        candidates = [p for p in candidates if p]  # drop empties from stray/trailing commas
+                        added, skipped = [], []
+                        for p in candidates:
+                            if p not in config["ignore_patterns"]:
+                                config["ignore_patterns"].append(p)
+                                added.append(p)
+                                changed = True
+                            else:
+                                skipped.append(p)
+                        if added:
+                            cprint(f"[+] {len(added)} pattern(s) added: {', '.join(added)}", Colors.GREEN)
+                        if skipped:
+                            cprint(f"[i] Already present, skipped: {', '.join(skipped)}", Colors.GREY)
                 elif sub == "r":
                     p = input("Pattern to remove: ").strip()
                     if p in config["ignore_patterns"]:
@@ -439,18 +465,38 @@ def file_hash(filepath):
 
 def should_ignore(path_str, ignore_patterns):
     """
-    Return True if any component of the path matches a glob ignore pattern.
+    Return True if path_str matches an ignore pattern.
 
-    Uses fnmatch so the full glob syntax works: *.log, test_*, file?.txt,
-    [abc]*.py, etc. Matching is applied to each individual path component
-    (directory names and the filename), not the full path string.
+    Two matching modes, selected per-pattern by the presence of '/':
+      - No '/' in the pattern: matched against each individual path
+        component via fnmatch (legacy behavior, unchanged) — e.g.
+        "node_modules" or "*.log" match at any depth.
+      - '/' present in the pattern: matched against the FULL relative
+        path (POSIX-style) via fnmatch — e.g. "exports/projects" only
+        excludes that exact path, leaving any other "projects" folder
+        elsewhere in the tree untouched. A leading or trailing '/' is
+        stripped before matching, since relative paths from the scan
+        never start or end with one — "/exports/projects" and
+        "exports/projects/" both behave identically to
+        "exports/projects".
+
+    Path-mode patterns must always use forward slashes, even on
+    Windows — relative paths are normalized to POSIX style throughout
+    the codebase (see collect_files()/_scan_tree()) specifically so a
+    single pattern works identically on every platform.
     """
+    rel_posix = Path(path_str).as_posix()
     parts = Path(path_str).parts
-    return any(
-        fnmatch.fnmatch(part, pattern)
-        for part in parts
-        for pattern in ignore_patterns
-    )
+
+    for pattern in ignore_patterns:
+        if "/" in pattern:
+            pat = pattern.strip("/")
+            if fnmatch.fnmatch(rel_posix, pat):
+                return True
+        else:
+            if any(fnmatch.fnmatch(part, pattern) for part in parts):
+                return True
+    return False
 
 
 def _scan_tree(dir_path, ignore_patterns, rel_prefix=""):
@@ -473,14 +519,20 @@ def _scan_tree(dir_path, ignore_patterns, rel_prefix=""):
 
     Directory pruning: a directory is not descended into if its own
     relative path already matches ignore_patterns (via should_ignore(),
-    same fnmatch-per-component logic used for files). This is a pure
-    speed optimization, not a behavior change — should_ignore() checks
-    EVERY component of a path, so any file underneath a matched directory
-    would already have that matched component in its own path and would
-    have been filtered out downstream anyway. Pruning just skips the
-    os.scandir() work of walking into directories like node_modules,
-    .git, dist, build, __pycache__, .cache before throwing their
-    contents away.
+    same per-component or full-path fnmatch logic used for files). This
+    is a pure speed optimization, not a behavior change — for
+    component-mode patterns, should_ignore() checks EVERY component of
+    a path, so any file underneath a matched directory would already
+    have that matched component in its own path and would have been
+    filtered out downstream anyway. The same guarantee holds for
+    full-path patterns (those containing '/'): should_ignore() is
+    called at every level of the descent with the relative path
+    accumulated so far, so a pattern like "exports/projects" triggers
+    pruning at the exact moment the walk reaches that specific
+    directory — no sooner, no later — and every file beneath it would
+    have matched too. Pruning just skips the os.scandir() work of
+    walking into directories like node_modules, .git, dist, build,
+    __pycache__, .cache before throwing their contents away.
     """
     try:
         with os.scandir(dir_path) as it:
@@ -1868,6 +1920,65 @@ def run_main_menu(config):
             print()
 
 
+def _run_one_interactive_sync(config, args):
+    """
+    One pass of the bare-invocation flow (ticket 9): acquire the lock,
+    prompt for sync direction, run the sync, write the log. Extracted
+    from the single-pass block below so the main-menu loop can call it
+    repeatedly without ever calling sys.exit() — after this function
+    returns, control always goes back to run_main_menu() instead of
+    terminating the process.
+
+    Mirrors the lock/prompt/run_sync/log sequence of the scripted
+    single-pass flow further down, with two differences required by
+    the loop: no sys.exit() anywhere (every abort path is a plain
+    return), and the lock is explicitly released in a finally block —
+    success, error, or cancellation alike — so the next pass through
+    the menu can re-acquire it. The scripted flow doesn't need this
+    since it never loops; it just leaves the lock for the atexit
+    handler registered in acquire_lock().
+
+    Caller is responsible for resetting args.direction to None before
+    each call — otherwise a direction picked on a previous pass would
+    stick and the prompt below would silently stop reappearing.
+    """
+    if not acquire_lock():
+        cprint("[✗] Another dirsync instance is already running with this config.", Colors.RED)
+        cprint("    Remove the lock file if this is wrong:", Colors.YELLOW)
+        cprint(f"    {LOCK_FILE}", Colors.GREY)
+        return
+
+    try:
+        if args.direction is None:
+            print_section("Sync direction")
+            print("  [1] Source  ➜  Destination   (default)")
+            print("  [2] Destination  ➜  Source   (reverse)")
+            print("  [3] Bidirectional smart       (newest wins)")
+            print()
+            try:
+                raw = input("Direction (1/2/3) [1]: ").strip()
+            except KeyboardInterrupt:
+                print()
+                cprint("\n[✗] Cancelled.", Colors.YELLOW)
+                return
+            args.direction = {"2": "dst", "3": "smart"}.get(raw, "src")
+            print()
+
+        try:
+            success, errors, copied, deleted = run_sync(config, args)
+        except UserCancelled as e:
+            cprint(f"[i] {e}", Colors.GREY)
+            return
+
+        if args.log:
+            write_log(
+                config["source"], config["destination"],
+                args.direction, success, errors, copied, deleted,
+            )
+    finally:
+        _release_lock()
+
+
 def main():
     global _USE_COLOR
 
@@ -1943,14 +2054,25 @@ def main():
 
     show_config(config)
 
-    # New interactive main menu (ticket 8) — bare invocation only. Any
-    # of the mode-selecting flags checked by _bare_invocation() skips
-    # this entirely and falls straight through to the lock/direction
-    # prompt/run_sync sequence below, exactly as before this ticket.
-    # run_main_menu() only returns once the user picked [1] Start a
-    # sync; [2]/[3] loop internally, [0]/Ctrl+C exit(0).
+    # New interactive main menu (ticket 8/9) — bare invocation only.
+    # Any of the mode-selecting flags checked by _bare_invocation()
+    # skips this entirely and falls straight through to the scripted
+    # lock/direction prompt/run_sync sequence below, exactly as before
+    # ticket 8. For a bare invocation, this loops forever instead of
+    # falling through: run_main_menu() only returns once the user
+    # picked [1] Start a sync ([2]/[3] loop internally); each such
+    # return runs one interactive sync and then goes straight back to
+    # the menu, so a bare `dirsync.py` invocation only ever ends via
+    # [0] Quit or Ctrl+C inside run_main_menu() itself, both of which
+    # call sys.exit() directly there (ticket 9 — fixes ticket 8's
+    # unintended single-pass fallthrough into the sys.exit() below).
     if _bare_invocation(args):
-        run_main_menu(config)
+        while True:
+            run_main_menu(config)
+            args.direction = None  # mandatory reset — see ticket 9 edge case
+            _run_one_interactive_sync(config, args)
+            print()
+        # unreachable — the loop only ends via sys.exit() inside run_main_menu()
 
     # Prevent two instances from running against the same config simultaneously
     if not acquire_lock():
